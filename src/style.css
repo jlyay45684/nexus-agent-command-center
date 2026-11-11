@@ -89,3 +89,7 @@ select { background: rgba(4,12,24,0.8); color: var(--ink); border: 1px solid var
   .radar::before { animation: none; }
   * { scroll-behavior: auto !important; }
 }
+/* optimization UI additions */
+.btn.active { border-color: var(--cyan); box-shadow: 0 0 12px rgba(99,230,255,0.22) inset, 0 0 10px rgba(99,230,255,0.12); }
+.metrics { grid-template-columns: 1fr 1fr; }
+.metric b { font-size: 15px; }

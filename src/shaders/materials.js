@@ -3,7 +3,6 @@
   varying vec3 vPos;
   uniform float uTime;
   uniform float uPulse;
-  // simplex-ish noise
   vec3 mod289(vec3 x){return x - floor(x*(1.0/289.0))*289.0;}
   vec4 mod289(vec4 x){return x - floor(x*(1.0/289.0))*289.0;}
   vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
@@ -53,26 +52,41 @@ export const coreFragment = /* glsl */`
   }
 `;
 
+// Nebula now samples a pre-generated low-res noise texture instead of per-fragment FBM.
+// 3 layered samples with slow UV offsets preserve purple/blue/pink depth and breathing.
 export const nebulaVertex = /* glsl */`
   attribute float aSize;
   attribute float aSeed;
   uniform float uTime;
   uniform float uPixelRatio;
+  uniform sampler2D uNoiseTex;
   varying float vAlpha;
   varying vec3 vColor;
   uniform vec3 uColorA;
   uniform vec3 uColorB;
+  uniform vec3 uColorC;
   void main(){
     vec3 p = position;
-    float t = uTime * 0.08 + aSeed * 6.2831;
-    p.x += sin(t + position.y*0.3)*0.12;
-    p.z += cos(t*0.9 + position.x*0.25)*0.12;
+    float t = uTime * 0.06 + aSeed * 6.2831;
+    // slow breathing/flow offsets (no FBM)
+    p.x += sin(t + position.y*0.22)*0.16;
+    p.z += cos(t*0.85 + position.x*0.18)*0.16;
+    p.y += sin(t*0.6 + position.z*0.15)*0.08;
     vec4 mv = modelViewMatrix * vec4(p,1.0);
     gl_Position = projectionMatrix * mv;
     float dist = -mv.z;
-    gl_PointSize = aSize * uPixelRatio * (22.0 / max(dist, 1.0));
-    vAlpha = smoothstep(18.0, 2.0, dist) * (0.55 + 0.45*sin(aSeed*12.0 + uTime*0.6));
-    vColor = mix(uColorA, uColorB, fract(aSeed*3.17));
+    gl_PointSize = aSize * uPixelRatio * (24.0 / max(dist, 1.0));
+    // texture-sampled modulation for depth/breathing (3 samples, cheap)
+    vec2 uv = p.xz * 0.045 + vec2(uTime*0.012, uTime*0.008);
+    float n1 = texture2D(uNoiseTex, uv + aSeed).r;
+    float n2 = texture2D(uNoiseTex, uv*1.7 - vec2(uTime*0.01, 0.0) + aSeed*0.37).g;
+    float n3 = texture2D(uNoiseTex, uv*0.6 + vec2(0.0, uTime*0.007)).b;
+    float dens = n1*0.5 + n2*0.3 + n3*0.2;
+    float breath = 0.75 + 0.25*sin(uTime*0.35 + aSeed*6.2831);
+    vAlpha = smoothstep(18.0, 2.5, dist) * (0.35 + 0.65*dens) * breath;
+    // preserve purple, blue, pink gradient
+    vec3 c1 = mix(uColorA, uColorB, n2);
+    vColor = mix(c1, uColorC, n3*0.7);
   }
 `;
 
@@ -82,8 +96,76 @@ export const nebulaFragment = /* glsl */`
   void main(){
     vec2 uv = gl_PointCoord - 0.5;
     float d = length(uv);
-    float a = smoothstep(0.5, 0.05, d) * vAlpha;
+    float a = smoothstep(0.5, 0.06, d) * vAlpha;
     if(a < 0.01) discard;
     gl_FragColor = vec4(vColor, a);
+  }
+`;
+
+// Post-processing: chromatic aberration, halation, grain (texture), scanlines, vignette, radial warp.
+// Optimized: fewer samples; grain via low-cost noise texture lookup (no animated heavy math);
+// warp uniforms gated so when warp<=0 the shader skips warp math.
+export const postVertex = /* glsl */`
+  varying vec2 vUv;
+  void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }
+`;
+
+export const postFragment = /* glsl */`
+  uniform sampler2D tDiffuse;
+  uniform sampler2D tNoise;
+  uniform float uTime;
+  uniform float uWarp;      // 0 = off
+  uniform float uHue;
+  uniform float uCA;        // chromatic aberration amount
+  uniform vec2 uResolution;
+  varying vec2 vUv;
+
+  vec3 hueShift(vec3 color, float hue){
+    const vec3 k = vec3(0.57735, 0.57735, 0.57735);
+    float cosA = cos(hue);
+    return color * cosA + cross(k, color) * sin(hue) + k * dot(k, color) * (1.0 - cosA);
+  }
+
+  void main(){
+    vec2 uv = vUv;
+    vec2 center = uv - 0.5;
+    float dist = length(center);
+
+    // Radial warp (skipped when off)
+    if (uWarp > 0.001) {
+      float w = uWarp * dist * dist;
+      uv = uv + normalize(center + 1e-5) * w;
+    }
+
+    // Chromatic aberration (2 extra samples) - scaled by uCA
+    float ca = uCA * (0.002 + dist * 0.004);
+    vec2 dir = normalize(center + 1e-5) * ca;
+    float r = texture2D(tDiffuse, uv + dir).r;
+    float g = texture2D(tDiffuse, uv).g;
+    float b = texture2D(tDiffuse, uv - dir).b;
+    vec3 col = vec3(r,g,b);
+
+    // Halation (cheap single-tap bloom-ish glow around brights)
+    float luma = dot(col, vec3(0.299,0.587,0.114));
+    float halo = smoothstep(0.55, 1.0, luma) * 0.18;
+    col += col * halo;
+
+    // Hue shift
+    if (abs(uHue) > 0.001) col = hueShift(col, uHue);
+
+    // Scanlines (very cheap)
+    float scan = 0.985 + 0.015 * sin(vUv.y * uResolution.y * 1.2);
+    col *= scan;
+
+    // Grain via low-cost noise texture (pre-generated, no animated heavy math)
+    vec2 nUv = vUv * (uResolution / 256.0) + vec2(uTime * 0.07, uTime * 0.11);
+    float grain = texture2D(tNoise, nUv).r - 0.5;
+    col += grain * 0.045;
+
+    // Vignette
+    float vig = smoothstep(0.85, 0.25, dist);
+    col *= mix(0.78, 1.0, vig);
+
+    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);
   }
 `;

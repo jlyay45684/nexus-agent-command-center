@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
-    <meta name="description" content="NEXUS — 3D AI Agent Command Center (Simulation)" />
+    <meta name="description" content="NEXUS — 3D AI Agent Command Center (Simulation, GPU-optimized)" />
     <title>NEXUS — AI Agent Command Center</title>
   </head>
   <body>
@@ -43,6 +43,13 @@
           <label>Camera Zoom
             <input id="zoom" type="range" min="6" max="22" step="0.1" value="13" />
           </label>
+          <label>Hue Shift
+            <input id="hue" type="range" min="-1.5" max="1.5" step="0.01" value="0" />
+          </label>
+        </div>
+        <div class="actions" style="margin-top:8px">
+          <button id="btn-bloom" class="btn active">Bloom: On</button>
+          <button id="btn-warp" class="btn">Warp: Off</button>
         </div>
         <h3>Agents</h3>
         <ul id="agent-list" class="agent-list"></ul>
@@ -51,7 +58,10 @@
         <h2>Telemetry</h2>
         <div class="metrics">
           <div class="metric"><small>FPS</small><b id="fps">--</b></div>
-          <div class="metric"><small>Quality</small><b id="quality-label">Auto</b></div>
+          <div class="metric"><small>Frame ms</small><b id="frame-label">--</b></div>
+          <div class="metric"><small>Quality</small><b id="quality-label">Balanced</b></div>
+          <div class="metric"><small>Render Scale</small><b id="scale-label">0.82</b></div>
+          <div class="metric"><small>Particles</small><b id="particles-label">48,000</b></div>
           <div class="metric"><small>Active</small><b id="active-count">0</b></div>
           <div class="metric"><small>Alerts</small><b id="alert-count">0</b></div>
         </div>
@@ -59,13 +69,14 @@
           <select id="quality">
             <option value="auto" selected>Auto</option>
             <option value="high">High</option>
-            <option value="medium">Medium</option>
-            <option value="low">Low</option>
+            <option value="balanced">Balanced</option>
+            <option value="performance">Performance</option>
+            <option value="mobile">Mobile</option>
           </select>
         </label>
         <h3>Event Log</h3>
         <div id="log" class="log" aria-live="polite"></div>
-        <p class="disclaimer">All agent activity is <b>Simulation</b>. No real LLM execution.</p>
+        <p class="disclaimer">All agent activity is <b>Simulation</b>. No real LLM execution. Render scale applies to 3D buffer; HUD stays native.</p>
       </aside>
       <div id="fallback" class="fallback hidden">
         <div class="fallback-card">

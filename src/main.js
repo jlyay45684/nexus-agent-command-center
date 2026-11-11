@@ -1,10 +1,11 @@
 ﻿import * as THREE from 'three';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
-import { coreVertex, coreFragment, nebulaVertex, nebulaFragment } from './shaders/materials.js';
-import { QualityManager } from './perf/QualityManager.js';
+import { coreVertex, coreFragment, nebulaVertex, nebulaFragment, postVertex, postFragment } from './shaders/materials.js';
+import { QualityManager, QUALITY_PRESETS, QUALITY_ORDER } from './perf/QualityManager.js';
 
 const canvas = document.getElementById('scene');
 const fallbackEl = document.getElementById('fallback');
@@ -12,9 +13,14 @@ const logEl = document.getElementById('log');
 const agentListEl = document.getElementById('agent-list');
 const fpsEl = document.getElementById('fps');
 const qualityLabelEl = document.getElementById('quality-label');
+const scaleLabelEl = document.getElementById('scale-label');
+const particlesLabelEl = document.getElementById('particles-label');
+const frameLabelEl = document.getElementById('frame-label');
 const activeCountEl = document.getElementById('active-count');
 const alertCountEl = document.getElementById('alert-count');
 const clockEl = document.getElementById('clock');
+
+const MAX_PARTICLES = 70000;
 
 const state = {
   paused: false,
@@ -22,12 +28,16 @@ const state = {
   zoom: 13,
   selected: null,
   alerts: 0,
-  running: true,
+  running: false,
   visible: true,
   reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+  bloom: true,
+  warp: 0.0,
+  hue: 0.0,
 };
 
 function log(msg) {
+  if (!logEl) return;
   const t = new Date().toLocaleTimeString();
   const div = document.createElement('div');
   div.className = 'e';
@@ -35,91 +45,111 @@ function log(msg) {
   logEl.prepend(div);
   while (logEl.children.length > 80) logEl.lastChild.remove();
 }
-setInterval(() => { clockEl.textContent = new Date().toLocaleTimeString(); }, 1000);
-clockEl.textContent = new Date().toLocaleTimeString();
+setInterval(() => { if (clockEl) clockEl.textContent = new Date().toLocaleTimeString(); }, 1000);
+if (clockEl) clockEl.textContent = new Date().toLocaleTimeString();
 
-let renderer, scene, camera, composer, bloomPass, renderPass;
-let core, coreMat, nebula, nebulaMat, nebulaGeo;
-let agents = [];
-let links = [];
-let pulses = [];
+let renderer, scene, camera, composer, bloomPass, postPass, renderPass;
+let core, coreMat, coreWire, nebula, nebulaGeo, nebulaMat, noiseTex, grainTex;
 let networkGroup, pulseGroup;
+let agents = [];
+let linkLines = [];
+let ringMeshes = [];
+let pulses = [];
 let animationId = null;
-let lastTime = performance.now();
-let fpsAccum = 0, fpsFrames = 0, fpsLast = performance.now();
+let lastTime = 0;
+let fpsAccum = 0, fpsFrames = 0, fpsLast = 0;
 let qm;
+let currentScale = 0.82;
+
+function showFallback(reason) {
+  if (fallbackEl) fallbackEl.classList.remove('hidden');
+  log('WebGL fallback: ' + (reason || 'unavailable') + ' (Simulation).');
+}
 
 try {
   renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false, powerPreference: 'high-performance' });
 } catch (e) {
-  showFallback();
+  showFallback('init error');
 }
-if (!renderer || !renderer.getContext()) showFallback();
+if (!renderer || !renderer.getContext()) { showFallback('no context'); }
 
-function showFallback() {
-  fallbackEl.classList.remove('hidden');
-  log('WebGL unavailable/context lost — fallback mode (Simulation).');
-  throw new Error('WebGL unavailable');
-}
-
+// Context loss handling (static fallback, no multiple loops)
 canvas.addEventListener('webglcontextlost', (e) => {
   e.preventDefault();
   state.running = false;
-  cancelAnimationFrame(animationId);
-  fallbackEl.classList.remove('hidden');
+  if (animationId) cancelAnimationFrame(animationId);
+  animationId = null;
+  showFallback('context lost');
   log('WebGL context lost — rendering halted (Simulation).');
 });
 canvas.addEventListener('webglcontextrestored', () => {
-  fallbackEl.classList.add('hidden');
+  if (fallbackEl) fallbackEl.classList.add('hidden');
   log('WebGL context restored — reload recommended.');
 });
-document.getElementById('btn-reload').addEventListener('click', () => location.reload());
+const reloadBtn = document.getElementById('btn-reload');
+if (reloadBtn) reloadBtn.addEventListener('click', () => location.reload());
 
 scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(0x040812, 0.035);
 scene.background = new THREE.Color(0x040812);
 
-camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 100);
+camera = new THREE.PerspectiveCamera(55, 1, 0.1, 100);
 camera.position.set(0, 4, state.zoom);
 
-renderer.setClearColor(0x040812, 1);
-
-qm = new QualityManager((preset, level, reason, avg) => {
-  applyQuality(preset);
-  qualityLabelEl.textContent = `${preset.label}${qm.mode === 'auto' ? ' (Auto)' : ''}`;
-  if (reason && reason !== 'manual' && reason !== 'auto') {
-    log(`Quality ${reason} → ${preset.label}${avg ? ` (avg ${avg.toFixed(1)} fps)` : ''} [Simulation]`);
+// Pre-generate low-res noise texture ONCE (no per-frame regeneration)
+function makeNoiseTexture(size) {
+  const data = new Uint8Array(size * size * 4);
+  for (let i = 0; i < size * size; i++) {
+    const i4 = i * 4;
+    data[i4] = Math.floor(Math.random() * 256);
+    data[i4 + 1] = Math.floor(Math.random() * 256);
+    data[i4 + 2] = Math.floor(Math.random() * 256);
+    data[i4 + 3] = 255;
   }
-});
-
-function applyQuality(preset) {
-  const dpr = Math.min(window.devicePixelRatio || 1, preset.dprCap);
-  renderer.setPixelRatio(dpr);
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  if (composer) composer.setSize(window.innerWidth, window.innerHeight);
-  if (bloomPass) {
-    const enabled = preset.bloom !== 'off';
-    bloomPass.enabled = enabled;
-    bloomPass.strength = enabled ? preset.bloomStrength : 0;
-    bloomPass.radius = preset.bloomRadius || 0;
-    bloomPass.threshold = preset.bloomThreshold || 1;
-  }
-  rebuildNebula(preset.particles);
+  const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.needsUpdate = true;
+  tex.generateMipmaps = false;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  return tex;
 }
+noiseTex = makeNoiseTexture(128);
+grainTex = makeNoiseTexture(128);
 
-// Postprocessing
-composer = new EffectComposer(renderer);
-renderPass = new RenderPass(scene, camera);
-composer.addPass(renderPass);
-bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.9, 0.35, 0.2);
-composer.addPass(bloomPass);
-composer.addPass(new OutputPass());
+// Post-processing setup
+function setupComposer() {
+  const w = Math.floor(window.innerWidth * currentScale);
+  const h = Math.floor(window.innerHeight * currentScale);
+  renderer.setPixelRatio(1.0); // DPR cap 1.0
+  renderer.setSize(window.innerWidth, window.innerHeight); // canvas CSS/native for HUD; composer handles render scale
+  composer = new EffectComposer(renderer);
+  composer.setPixelRatio(1.0);
+  composer.setSize(w, h);
+  renderPass = new RenderPass(scene, camera);
+  composer.addPass(renderPass);
+  bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.55, 0.28, 0.28);
+  composer.addPass(bloomPass);
+  postPass = new ShaderPass({
+    uniforms: {
+      tDiffuse: { value: null },
+      tNoise: { value: grainTex },
+      uTime: { value: 0 },
+      uWarp: { value: 0.0 },
+      uHue: { value: 0.0 },
+      uCA: { value: 1.0 },
+      uResolution: { value: new THREE.Vector2(w, h) },
+    },
+    vertexShader: postVertex,
+    fragmentShader: postFragment,
+  });
+  composer.addPass(postPass);
+  composer.addPass(new OutputPass());
+}
+setupComposer();
 
 // Lights
-const ambient = new THREE.AmbientLight(0x335577, 0.6);
-scene.add(ambient);
+scene.add(new THREE.AmbientLight(0x335577, 0.6));
 const p1 = new THREE.PointLight(0x63e6ff, 2.2, 30); p1.position.set(0, 0, 0); scene.add(p1);
 const p2 = new THREE.PointLight(0xa06bff, 1.2, 40); p2.position.set(6, 4, -6); scene.add(p2);
 
@@ -137,7 +167,7 @@ coreMat = new THREE.ShaderMaterial({
 });
 core = new THREE.Mesh(new THREE.IcosahedronGeometry(1.35, 32), coreMat);
 scene.add(core);
-const coreWire = new THREE.Mesh(
+coreWire = new THREE.Mesh(
   new THREE.IcosahedronGeometry(1.55, 2),
   new THREE.MeshBasicMaterial({ color: 0xa06bff, wireframe: true, transparent: true, opacity: 0.18 })
 );
@@ -153,45 +183,45 @@ for (let i = 0; i < 3; i++) {
   ring.rotation.y = i * 0.7;
   ring.userData = { speed: (i % 2 ? 1 : -1) * (0.12 + i * 0.05) };
   scene.add(ring);
-  links.push(ring);
+  ringMeshes.push(ring);
 }
 
-// Nebula particles
-function rebuildNebula(count) {
-  if (nebula) { scene.remove(nebula); nebulaGeo.dispose(); nebulaMat.dispose(); }
-  nebulaGeo = new THREE.BufferGeometry();
-  const positions = new Float32Array(count * 3);
-  const sizes = new Float32Array(count);
-  const seeds = new Float32Array(count);
-  for (let i = 0; i < count; i++) {
-    const r = 3.2 + Math.random() * 9.5;
-    const theta = Math.random() * Math.PI * 2;
-    const phi = Math.acos(2 * Math.random() - 1);
-    positions[i*3] = r * Math.sin(phi) * Math.cos(theta);
-    positions[i*3+1] = r * Math.cos(phi) * 0.7;
-    positions[i*3+2] = r * Math.sin(phi) * Math.sin(theta);
-    sizes[i] = 0.6 + Math.random() * 1.8;
-    seeds[i] = Math.random();
-  }
-  nebulaGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  nebulaGeo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
-  nebulaGeo.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1));
-  nebulaMat = new THREE.ShaderMaterial({
-    uniforms: {
-      uTime: { value: 0 },
-      uPixelRatio: { value: renderer.getPixelRatio() },
-      uColorA: { value: new THREE.Color(0x63e6ff) },
-      uColorB: { value: new THREE.Color(0xa06bff) },
-    },
-    vertexShader: nebulaVertex,
-    fragmentShader: nebulaFragment,
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-  });
-  nebula = new THREE.Points(nebulaGeo, nebulaMat);
-  scene.add(nebula);
+// Nebula: allocate MAX once, adjust via setDrawRange (no rebuild)
+nebulaGeo = new THREE.BufferGeometry();
+const positions = new Float32Array(MAX_PARTICLES * 3);
+const sizes = new Float32Array(MAX_PARTICLES);
+const seeds = new Float32Array(MAX_PARTICLES);
+for (let i = 0; i < MAX_PARTICLES; i++) {
+  const r = 3.2 + Math.random() * 9.5;
+  const theta = Math.random() * Math.PI * 2;
+  const phi = Math.acos(2 * Math.random() - 1);
+  positions[i*3] = r * Math.sin(phi) * Math.cos(theta);
+  positions[i*3+1] = r * Math.cos(phi) * 0.7;
+  positions[i*3+2] = r * Math.sin(phi) * Math.sin(theta);
+  sizes[i] = 0.6 + Math.random() * 1.8;
+  seeds[i] = Math.random();
 }
+nebulaGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+nebulaGeo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+nebulaGeo.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1));
+nebulaGeo.setDrawRange(0, 48000);
+nebulaMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime: { value: 0 },
+    uPixelRatio: { value: 1.0 },
+    uNoiseTex: { value: noiseTex },
+    uColorA: { value: new THREE.Color(0x63e6ff) }, // blue-cyan
+    uColorB: { value: new THREE.Color(0xa06bff) }, // purple
+    uColorC: { value: new THREE.Color(0xff6bb3) }, // pink
+  },
+  vertexShader: nebulaVertex,
+  fragmentShader: nebulaFragment,
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+});
+nebula = new THREE.Points(nebulaGeo, nebulaMat);
+scene.add(nebula);
 
 // Network agents
 networkGroup = new THREE.Group();
@@ -208,40 +238,38 @@ const agentMats = {
   paused: new THREE.MeshStandardMaterial({ color: 0xffb347, emissive: 0x885a1a, emissiveIntensity: 1.0, roughness: 0.3, metalness: 0.4 }),
   selected: new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x63e6ff, emissiveIntensity: 2.0, roughness: 0.2, metalness: 0.5 }),
 };
-const lineMat = new THREE.LineBasicMaterial({ color: 0x2f6f99, transparent: true, opacity: 0.35 });
+const lineMatBase = new THREE.LineBasicMaterial({ color: 0x2f6f99, transparent: true, opacity: 0.35 });
 const pulseGeo = new THREE.SphereGeometry(0.045, 8, 8);
-const pulseMat = new THREE.MeshBasicMaterial({ color: 0x7ef7c4 });
+const pulseMatBase = new THREE.MeshBasicMaterial({ color: 0x7ef7c4 });
 
 function initAgents() {
   const R = 4.6;
   for (let i = 0; i < AGENT_COUNT; i++) {
     const a = (i / AGENT_COUNT) * Math.PI * 2;
-    const y = (Math.sin(i * 1.3) * 1.4);
+    const y = Math.sin(i * 1.3) * 1.4;
     const pos = new THREE.Vector3(Math.cos(a) * R, y, Math.sin(a) * R);
     const mesh = new THREE.Mesh(agentGeo, agentMats.ok.clone());
     mesh.position.copy(pos);
     mesh.userData.base = pos.clone();
     mesh.userData.phase = Math.random() * Math.PI * 2;
     const halo = new THREE.Mesh(new THREE.RingGeometry(0.18, 0.22, 32), new THREE.MeshBasicMaterial({ color: 0x63e6ff, transparent: true, opacity: 0.4, side: THREE.DoubleSide }));
-    halo.lookAt(0,0,0);
     mesh.add(halo);
     networkGroup.add(mesh);
     agents.push({ id: i, name: `AG-${String(i+1).padStart(2,'0')}`, mesh, status: 'ok', halo });
   }
-  // connections ring + some chords
-  const pts = agents.map(a => a.mesh.position);
   for (let i = 0; i < AGENT_COUNT; i++) {
     addLink(i, (i + 1) % AGENT_COUNT);
     if (i % 3 === 0) addLink(i, (i + 4) % AGENT_COUNT);
   }
   renderAgentList();
+  updateCounts();
 }
 function addLink(a, b) {
   const geo = new THREE.BufferGeometry().setFromPoints([agents[a].mesh.position, agents[b].mesh.position]);
-  const line = new THREE.Line(geo, lineMat.clone());
+  const line = new THREE.Line(geo, lineMatBase.clone());
   line.userData = { a, b };
   networkGroup.add(line);
-  links.push(line);
+  linkLines.push(line);
 }
 initAgents();
 
@@ -259,15 +287,28 @@ function setStatus(id, status) {
   renderAgentList();
   updateCounts();
 }
-
 function renderAgentList() {
+  if (!agentListEl) return;
   agentListEl.innerHTML = agents.map(a => `
     <li data-id="${a.id}" class="${state.selected===a.id?'selected':''}">
       <span class="name">${a.name}</span>
       <span class="st st-${a.status}">${a.status.toUpperCase()}</span>
     </li>`).join('');
 }
-agentListEl.addEventListener('click', (e) => {
+function updateCounts() {
+  if (activeCountEl) activeCountEl.textContent = agents.filter(a => a.status === 'busy' || a.status === 'ok').length;
+  if (alertCountEl) alertCountEl.textContent = agents.filter(a => a.status === 'fail').length;
+  state.alerts = agents.filter(a => a.status === 'fail').length;
+}
+function spawnPulse(a, b) {
+  const m = new THREE.Mesh(pulseGeo, pulseMatBase.clone());
+  m.userData = { a, b, t: 0, speed: 0.35 + Math.random() * 0.35 };
+  pulseGroup.add(m);
+  pulses.push(m);
+}
+
+// Agent list interaction
+if (agentListEl) agentListEl.addEventListener('click', (e) => {
   const li = e.target.closest('li'); if (!li) return;
   const id = Number(li.dataset.id);
   state.selected = state.selected === id ? null : id;
@@ -276,65 +317,83 @@ agentListEl.addEventListener('click', (e) => {
   log(`Agent ${agents[id].name} ${state.selected===id?'selected':'deselected'} [Simulation]`);
 });
 
-function updateCounts() {
-  activeCountEl.textContent = agents.filter(a => a.status === 'busy' || a.status === 'ok').length;
-  alertCountEl.textContent = agents.filter(a => a.status === 'fail').length;
-  state.alerts = Number(alertCountEl.textContent);
-}
-updateCounts();
-
-function spawnPulse(a, b) {
-  const m = new THREE.Mesh(pulseGeo, pulseMat.clone());
-  m.userData = { a, b, t: 0, speed: 0.35 + Math.random() * 0.35 };
-  pulseGroup.add(m);
-  pulses.push(m);
-}
-
-// Controls
-document.getElementById('btn-dispatch').addEventListener('click', () => {
+// Controls (preserve existing behavior)
+const byId = (id) => document.getElementById(id);
+byId('btn-dispatch')?.addEventListener('click', () => {
   const idle = agents.filter(a => a.status === 'ok');
   if (!idle.length) { log('Dispatch skipped — no available agents [Simulation]'); return; }
   const count = Math.min(3, idle.length);
   for (let i = 0; i < count; i++) {
-    const a = idle[Math.floor(Math.random()*idle.length)];
-    setStatus(a.id, 'busy');
-    log(`Mission dispatched to ${a.name} [Simulation]`);
-    const link = links.find(l => l.userData.a === a.id || l.userData.b === a.id);
+    const pick = idle[Math.floor(Math.random()*idle.length)];
+    setStatus(pick.id, 'busy');
+    log(`Mission dispatched to ${pick.name} [Simulation]`);
+    const link = linkLines.find(l => l.userData.a === pick.id || l.userData.b === pick.id);
     if (link) spawnPulse(link.userData.a, link.userData.b);
-    setTimeout(() => { if (agents[a.id].status === 'busy' && !state.paused) setStatus(a.id, 'ok'); }, 2500 + Math.random()*2500);
+    setTimeout(() => { if (agents[pick.id] && agents[pick.id].status === 'busy' && !state.paused) setStatus(pick.id, 'ok'); }, 2500 + Math.random()*2500);
   }
-  coreMat.uniforms.uPulse.value = 1.0;
+  if (coreMat) coreMat.uniforms.uPulse.value = 1.0;
 });
-document.getElementById('btn-pause').addEventListener('click', (e) => {
+byId('btn-pause')?.addEventListener('click', (e) => {
   state.paused = !state.paused;
   e.target.textContent = state.paused ? 'Resume' : 'Pause';
   agents.forEach(a => { if (a.status === 'busy') setStatus(a.id, state.paused ? 'paused' : 'busy'); });
   log(state.paused ? 'System paused [Simulation]' : 'System resumed [Simulation]');
 });
-document.getElementById('btn-fail').addEventListener('click', () => {
+byId('btn-fail')?.addEventListener('click', () => {
   const candidates = agents.filter(a => a.status !== 'fail');
   if (!candidates.length) return;
   const a = candidates[Math.floor(Math.random()*candidates.length)];
   setStatus(a.id, 'fail');
   log(`Failure simulated on ${a.name} [Simulation]`);
 });
-document.getElementById('btn-recover').addEventListener('click', () => {
+byId('btn-recover')?.addEventListener('click', () => {
   let target = state.selected != null ? agents[state.selected] : agents.find(a => a.status === 'fail');
   if (!target || target.status !== 'fail') { log('No failed agent to recover [Simulation]'); return; }
   setStatus(target.id, 'ok');
   log(`Agent ${target.name} recovered [Simulation]`);
 });
-document.getElementById('rot-speed').addEventListener('input', (e) => { state.rotationSpeed = Number(e.target.value); });
-document.getElementById('zoom').addEventListener('input', (e) => { state.zoom = Number(e.target.value); });
-document.getElementById('quality').addEventListener('change', (e) => {
-  qm.setMode(e.target.value);
-  log(`Quality set to ${e.target.value} [Simulation]`);
+byId('rot-speed')?.addEventListener('input', (e) => { state.rotationSpeed = Number(e.target.value); });
+byId('zoom')?.addEventListener('input', (e) => { state.zoom = Number(e.target.value); }); // scroll/camera zoom preserved
+
+// Warp / Hue / Bloom controls
+byId('btn-bloom')?.addEventListener('click', (e) => {
+  state.bloom = !state.bloom;
+  e.target.classList.toggle('active', state.bloom);
+  e.target.textContent = state.bloom ? 'Bloom: On' : 'Bloom: Off';
+  if (bloomPass) bloomPass.enabled = state.bloom && qm.preset.bloomMip > 0;
+  log(`Bloom ${state.bloom ? 'enabled' : 'disabled'} [Simulation]`);
+});
+byId('btn-warp')?.addEventListener('click', (e) => {
+  state.warp = state.warp > 0.01 ? 0.0 : 0.12;
+  e.target.classList.toggle('active', state.warp > 0.01);
+  if (postPass) postPass.uniforms.uWarp.value = state.warp;
+  log(`Warp ${state.warp > 0.01 ? 'enabled' : 'disabled'} [Simulation]`);
+});
+byId('hue')?.addEventListener('input', (e) => {
+  state.hue = Number(e.target.value);
+  if (postPass) postPass.uniforms.uHue.value = state.hue;
 });
 
-// Raycaster selection
+// Quality
+const qualitySel = byId('quality');
+if (qualitySel) {
+  // ensure options exist for new profiles
+  qualitySel.innerHTML = `<option value="auto" selected>Auto</option>
+    <option value="high">High</option>
+    <option value="balanced">Balanced</option>
+    <option value="performance">Performance</option>
+    <option value="mobile">Mobile</option>`;
+  qualitySel.addEventListener('change', (e) => {
+    qm.setMode(e.target.value);
+    log(`Quality set to ${e.target.value} [Simulation]`);
+  });
+}
+
+// Raycaster selection (pointer interaction preserved)
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 canvas.addEventListener('pointerdown', (e) => {
+  if (!camera) return;
   const rect = canvas.getBoundingClientRect();
   pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -342,86 +401,135 @@ canvas.addEventListener('pointerdown', (e) => {
   const hits = raycaster.intersectObjects(agents.map(a => a.mesh));
   if (hits.length) {
     const id = agents.findIndex(a => a.mesh === hits[0].object);
-    if (id >= 0) { state.selected = state.selected === id ? null : id; agents.forEach(updateAgentMaterial); renderAgentList(); log(`Agent ${agents[id].name} ${state.selected===id?'selected':'deselected'} [Simulation]`); }
+    if (id >= 0) {
+      state.selected = state.selected === id ? null : id;
+      agents.forEach(updateAgentMaterial);
+      renderAgentList();
+      log(`Agent ${agents[id].name} ${state.selected===id?'selected':'deselected'} [Simulation]`);
+    }
   }
 });
 
-// Visibility / lifecycle
+// Quality application
+function applyQuality(preset, level) {
+  currentScale = preset.renderScale;
+  // DPR cap 1.0
+  renderer.setPixelRatio(1.0);
+  // HUD keeps native resolution (canvas CSS size = window); render at scaled size
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  const rw = Math.max(1, Math.floor(window.innerWidth * currentScale));
+  const rh = Math.max(1, Math.floor(window.innerHeight * currentScale));
+  if (composer) {
+    composer.setPixelRatio(1.0);
+    composer.setSize(rw, rh);
+  }
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  if (bloomPass) {
+    bloomPass.strength = preset.bloomStrength;
+    bloomPass.radius = preset.bloomRadius;
+    bloomPass.threshold = preset.bloomThreshold;
+    bloomPass.enabled = state.bloom && preset.bloomMip > 0;
+    // resolution follows composer render target
+  }
+  if (postPass && postPass.uniforms.uResolution) {
+    postPass.uniforms.uResolution.value.set(rw, rh);
+  }
+  if (nebulaGeo) nebulaGeo.setDrawRange(0, preset.particles);
+  if (nebulaMat) nebulaMat.uniforms.uPixelRatio.value = 1.0;
+  if (qualityLabelEl) qualityLabelEl.textContent = `${preset.label}${qm && qm.mode === 'auto' ? ' (Auto)' : ''}`;
+  if (scaleLabelEl) scaleLabelEl.textContent = currentScale.toFixed(2);
+  if (particlesLabelEl) particlesLabelEl.textContent = preset.particles.toLocaleString();
+}
+
+qm = new QualityManager((preset, level, reason, avg) => {
+  applyQuality(preset, level);
+  if (qualityLabelEl) qualityLabelEl.textContent = `${preset.label}${qm.mode === 'auto' ? ' (Auto)' : ''}`;
+  if (reason && reason !== 'manual' && reason !== 'auto') {
+    log(`Quality ${reason} → ${preset.label}${avg ? ` (ema ${avg.toFixed(1)} fps)` : ''} [Simulation]`);
+  }
+});
+
+applyQuality(qm.preset, qm.level);
+
+// Resize: update renderer, composer, shader uniforms
+window.addEventListener('resize', () => {
+  if (!renderer || !camera) return;
+  applyQuality(qm.preset, qm.level);
+});
+
+// Visibility / lifecycle: stop render loop when hidden, restart on visible (no multiple loops)
+function stopLoop() {
+  state.running = false;
+  if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
+}
+function startLoop() {
+  if (state.running) return;
+  if (document.hidden) return;
+  state.running = true;
+  lastTime = performance.now();
+  fpsLast = lastTime;
+  fpsAccum = 0; fpsFrames = 0;
+  animationId = requestAnimationFrame(loop);
+}
 document.addEventListener('visibilitychange', () => {
   state.visible = !document.hidden;
-  if (state.visible) { lastTime = performance.now(); if (state.running) loop(lastTime); }
-  else { cancelAnimationFrame(animationId); }
+  if (document.hidden) stopLoop();
+  else startLoop();
 });
-const io = new IntersectionObserver((entries) => {
-  const vis = entries[0]?.isIntersecting;
-  if (vis === false) { state.visible = false; cancelAnimationFrame(animationId); }
-  else if (vis === true && !document.hidden) { state.visible = true; lastTime = performance.now(); if (state.running) loop(lastTime); }
-}, { threshold: 0.05 });
-io.observe(canvas);
-
-window.addEventListener('resize', () => {
-  applyQuality(qm.preset);
-});
-
-applyQuality(qm.preset);
-qualityLabelEl.textContent = `${qm.preset.label} (Auto)`;
-log('NEXUS Command Center initialized [Simulation]');
-log('All agent activity is simulated. No real LLM execution.');
 
 function loop(now) {
-  if (!state.running || !state.visible) return;
+  if (!state.running) return;
   animationId = requestAnimationFrame(loop);
   const dt = Math.min((now - lastTime) / 1000, 0.1);
   lastTime = now;
 
-  // FPS
+  // FPS measurement reflects actual rendering
   fpsAccum += dt; fpsFrames++;
+  const frameMs = dt * 1000;
   if (now - fpsLast >= 500) {
-    const fps = fpsFrames / fpsAccum;
-    fpsEl.textContent = fps.toFixed(0);
+    const fps = fpsFrames / Math.max(fpsAccum, 0.001);
+    if (fpsEl) fpsEl.textContent = fps.toFixed(0);
+    if (frameLabelEl) frameLabelEl.textContent = frameMs.toFixed(1);
     qm.sample(fps, now);
     fpsAccum = 0; fpsFrames = 0; fpsLast = now;
+  } else {
+    if (frameLabelEl) frameLabelEl.textContent = frameMs.toFixed(1);
   }
 
   const t = now * 0.001;
   const motion = state.reducedMotion ? 0.15 : 1;
   const run = state.paused ? 0 : 1;
 
-  coreMat.uniforms.uTime.value = t;
-  coreMat.uniforms.uPulse.value *= 0.92;
-  core.rotation.y += 0.15 * dt * motion;
-  coreWire.rotation.y -= 0.08 * dt * motion;
-  coreWire.rotation.x += 0.05 * dt * motion;
-  if (nebulaMat) {
-    nebulaMat.uniforms.uTime.value = t;
-    nebulaMat.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+  if (coreMat) {
+    coreMat.uniforms.uTime.value = t;
+    coreMat.uniforms.uPulse.value *= 0.92;
   }
+  if (core) core.rotation.y += 0.15 * dt * motion;
+  if (coreWire) { coreWire.rotation.y -= 0.08 * dt * motion; coreWire.rotation.x += 0.05 * dt * motion; }
+  if (nebulaMat) nebulaMat.uniforms.uTime.value = t;
   if (nebula) nebula.rotation.y += 0.02 * dt * motion * state.rotationSpeed;
 
-  links.forEach((obj) => {
-    if (obj.isMesh && obj.userData.speed) {
-      obj.rotation.z += obj.userData.speed * dt * motion * run;
-      obj.rotation.x += obj.userData.speed * 0.5 * dt * motion * run;
-    }
+  ringMeshes.forEach((ring) => {
+    ring.rotation.z += ring.userData.speed * dt * motion * run;
+    ring.rotation.x += ring.userData.speed * 0.5 * dt * motion * run;
   });
 
-  // agent float & link update
-  networkGroup.rotation.y += 0.08 * dt * motion * state.rotationSpeed * run;
-  agents.forEach((a, i) => {
+  // agent float & link update (preserve pointer/scroll interactions)
+  if (networkGroup) networkGroup.rotation.y += 0.08 * dt * motion * state.rotationSpeed * run;
+  agents.forEach((a) => {
     const b = a.mesh.userData.base;
     const ph = a.mesh.userData.phase;
     a.mesh.position.y = b.y + Math.sin(t * 0.8 + ph) * 0.12 * motion;
-    a.halo.lookAt(camera.position);
+    if (a.halo) a.halo.lookAt(camera.position);
   });
-  links.forEach(l => {
-    if (l.isLine) {
-      const pos = l.geometry.attributes.position;
-      const pa = agents[l.userData.a].mesh.position;
-      const pb = agents[l.userData.b].mesh.position;
-      pos.setXYZ(0, pa.x, pa.y, pa.z);
-      pos.setXYZ(1, pb.x, pb.y, pb.z);
-      pos.needsUpdate = true;
-    }
+  linkLines.forEach(l => {
+    const pos = l.geometry.attributes.position;
+    const pa = agents[l.userData.a].mesh.position;
+    const pb = agents[l.userData.b].mesh.position;
+    pos.setXYZ(0, pa.x, pa.y, pa.z);
+    pos.setXYZ(1, pb.x, pb.y, pb.z);
+    pos.needsUpdate = true;
   });
 
   // pulses
@@ -435,23 +543,33 @@ function loop(now) {
     if (p.userData.t > 2.5) { pulseGroup.remove(p); pulses.splice(i,1); }
   }
 
-  // camera zoom lerp
-  const targetZ = state.zoom;
-  camera.position.z += (targetZ - camera.position.z) * 0.05;
+  // camera zoom lerp (scroll/zoom control preserved)
+  camera.position.z += (state.zoom - camera.position.z) * 0.05;
   camera.position.y += (4 - camera.position.y) * 0.05;
   camera.lookAt(0, 0, 0);
 
-  if (bloomPass && bloomPass.enabled) composer.render();
+  if (postPass) {
+    postPass.uniforms.uTime.value = t;
+    postPass.uniforms.uWarp.value = state.warp;
+    postPass.uniforms.uHue.value = state.hue;
+  }
+
+  // Render through composer (post + bloom). Bloom pass can be disabled while keeping other effects.
+  if (composer) composer.render();
   else renderer.render(scene, camera);
 }
 
-animationId = requestAnimationFrame(loop);
-
-// ambient mission pulses
+// Ambient mission pulses
 setInterval(() => {
-  if (state.paused || !state.visible || state.reducedMotion) return;
-  if (links.length) {
-    const l = links[Math.floor(Math.random()*links.length)];
-    if (l.isLine) spawnPulse(l.userData.a, l.userData.b);
+  if (state.paused || document.hidden || state.reducedMotion) return;
+  if (linkLines.length) {
+    const l = linkLines[Math.floor(Math.random()*linkLines.length)];
+    spawnPulse(l.userData.a, l.userData.b);
   }
 }, 1200);
+
+log('NEXUS Command Center initialized [Simulation] (perf build)');
+log('All agent activity is simulated. No real LLM execution.');
+
+// Start single render loop
+startLoop();

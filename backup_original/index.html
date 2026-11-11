@@ -1,0 +1,81 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="NEXUS — 3D AI Agent Command Center (Simulation)" />
+    <title>NEXUS — AI Agent Command Center</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene"></canvas>
+      <div id="hud" aria-hidden="true">
+        <div class="scanlines"></div>
+        <div class="radar" id="radar"></div>
+        <div class="hud-corner tl"></div>
+        <div class="hud-corner tr"></div>
+        <div class="hud-corner bl"></div>
+        <div class="hud-corner br"></div>
+      </div>
+      <header id="topbar">
+        <div class="brand">
+          <span class="glyph">◈</span>
+          <div><b>NEXUS</b><small>AI AGENT COMMAND CENTER</small></div>
+        </div>
+        <div class="top-status">
+          <span id="sim-badge" class="badge sim">SIMULATION</span>
+          <span class="badge" id="clock"></span>
+        </div>
+      </header>
+      <aside id="panel-left" class="panel">
+        <h2>Mission Control</h2>
+        <div class="actions">
+          <button id="btn-dispatch" class="btn primary">Dispatch Mission</button>
+          <button id="btn-pause" class="btn">Pause</button>
+          <button id="btn-fail" class="btn warn">Simulate Failure</button>
+          <button id="btn-recover" class="btn ok">Recover Agent</button>
+        </div>
+        <div class="row">
+          <label>Network Rotation
+            <input id="rot-speed" type="range" min="0" max="2" step="0.05" value="0.6" />
+          </label>
+          <label>Camera Zoom
+            <input id="zoom" type="range" min="6" max="22" step="0.1" value="13" />
+          </label>
+        </div>
+        <h3>Agents</h3>
+        <ul id="agent-list" class="agent-list"></ul>
+      </aside>
+      <aside id="panel-right" class="panel">
+        <h2>Telemetry</h2>
+        <div class="metrics">
+          <div class="metric"><small>FPS</small><b id="fps">--</b></div>
+          <div class="metric"><small>Quality</small><b id="quality-label">Auto</b></div>
+          <div class="metric"><small>Active</small><b id="active-count">0</b></div>
+          <div class="metric"><small>Alerts</small><b id="alert-count">0</b></div>
+        </div>
+        <label class="select-label">Quality Selector
+          <select id="quality">
+            <option value="auto" selected>Auto</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select>
+        </label>
+        <h3>Event Log</h3>
+        <div id="log" class="log" aria-live="polite"></div>
+        <p class="disclaimer">All agent activity is <b>Simulation</b>. No real LLM execution.</p>
+      </aside>
+      <div id="fallback" class="fallback hidden">
+        <div class="fallback-card">
+          <h2>WebGL Unavailable</h2>
+          <p>The 3D command center could not initialize (WebGL context lost or unsupported).</p>
+          <p>Simulation status and controls are shown in fallback mode. Try reloading or updating graphics drivers.</p>
+          <button id="btn-reload" class="btn primary">Reload</button>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
